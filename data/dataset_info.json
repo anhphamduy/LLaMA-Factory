@@ -2,6 +2,12 @@
   "identity": {
     "file_name": "identity.json"
   },
+  "pii": {
+    "file_name": "pii.json"
+  },
+  "pii_test": {
+    "file_name": "pii_test.json"
+  },
   "alpaca_en_demo": {
     "file_name": "alpaca_en_demo.json"
   },
