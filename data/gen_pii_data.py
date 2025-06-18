@@ -5,9 +5,9 @@ import json
 import random
 from datasets import load_dataset
 
-def main():
+def main(split="train"):
     # 1. Load the train split
-    ds = load_dataset("ai4privacy/open-pii-masking-500k-ai4privacy", split="train")
+    ds = load_dataset("ai4privacy/open-pii-masking-500k-ai4privacy", split=split)
 
     # 2. Extract the full set of labels
     all_labels = sorted({
@@ -51,12 +51,16 @@ def main():
     max_input_length = max(len(record["input"]) for record in records)
     print(f"Longest input text length: {max_input_length} characters")
 
+    filename = "pii.json"
+    if split == "validation":
+        filename = "pii_test.json"
+
     # 7. Write out a single JSON file
-    with open("pii.json", "w", encoding="utf-8") as fout:
+    with open(filename, "w", encoding="utf-8") as fout:
         json.dump(records, fout, ensure_ascii=False, indent=2)
 
-    print(f"✓ Wrote {len(records)} records to pii.json")
+    print(f"✓ Wrote {len(records)} records to {filename}")
 
 
 if __name__ == "__main__":
-    main()
+    main(split="validation")
