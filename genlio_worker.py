@@ -40,6 +40,7 @@ import httpx
 import pandas as pd
 from sqlalchemy import create_engine, Column, String, Integer, Float, Text, JSON, ForeignKey
 from sqlalchemy.orm import sessionmaker, declarative_base
+from transformers import TrainerCallback
 
 # Add LLaMA-Factory to path
 LLAMA_FACTORY_ROOT = Path(__file__).parent
@@ -123,6 +124,143 @@ class WorkerConfig:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+class GenlioProgressCallback(TrainerCallback):
+    """
+    Custom TrainerCallback that reports training progress to the Genlio database.
+    
+    This callback hooks into the HuggingFace Trainer lifecycle to capture:
+    - Training start/end events
+    - Step progress and timing
+    - Loss, learning rate, and other metrics
+    - Epoch progress
+    """
+    
+    def __init__(self, worker: "GenlioWorker", job_id: str):
+        super().__init__()
+        self.worker = worker
+        self.job_id = job_id
+        self.last_update_time = 0.0
+        self.update_interval = 5.0  # Minimum seconds between DB updates to avoid flooding
+        self.training_started = False
+    
+    def on_train_begin(self, args, state, control, **kwargs):
+        """Called when training starts. Captures total steps and epochs."""
+        self.training_started = True
+        self.last_update_time = time.time()
+        
+        logger.info(f"Training started: max_steps={state.max_steps}, num_epochs={args.num_train_epochs}")
+        
+        self.worker._update_job_status(
+            self.job_id,
+            current_step=0,
+            total_steps=state.max_steps,
+            current_epoch=0.0,
+            total_epochs=float(args.num_train_epochs),
+        )
+    
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Called when metrics are logged. Reports progress and metrics to database."""
+        if not logs:
+            return
+        
+        current_time = time.time()
+        
+        # Throttle updates to avoid database flooding
+        if current_time - self.last_update_time < self.update_interval:
+            return
+        
+        self.last_update_time = current_time
+        
+        # Extract metrics from logs
+        loss = logs.get("loss")
+        learning_rate = logs.get("learning_rate")
+        epoch = logs.get("epoch")
+        grad_norm = logs.get("grad_norm")
+        
+        # Build metrics dict, only including non-None values
+        metrics = {}
+        if loss is not None:
+            metrics["loss"] = float(loss)
+        if learning_rate is not None:
+            metrics["learning_rate"] = float(learning_rate)
+        if epoch is not None:
+            metrics["epoch"] = float(epoch)
+        if grad_norm is not None:
+            metrics["grad_norm"] = float(grad_norm)
+        
+        # Add eval metrics if present
+        eval_loss = logs.get("eval_loss")
+        if eval_loss is not None:
+            metrics["eval_loss"] = float(eval_loss)
+        
+        # Get step information from state
+        current_step = getattr(state, "global_step", None)
+        max_steps = getattr(state, "max_steps", None)
+        
+        logger.debug(
+            f"Progress update: step={current_step}/{max_steps}, "
+            f"epoch={epoch}, loss={loss}, lr={learning_rate}"
+        )
+        
+        self.worker._update_job_status(
+            self.job_id,
+            current_step=current_step,
+            total_steps=max_steps,
+            current_epoch=float(epoch) if epoch is not None else None,
+            metrics=metrics if metrics else None,
+        )
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        """Called at the end of each training step."""
+        # We primarily report on on_log which happens every logging_steps
+        # This hook is available for more granular tracking if needed
+        pass
+    
+    def on_train_end(self, args, state, control, **kwargs):
+        """Called when training ends. Final progress update."""
+        if not self.training_started:
+            return
+        
+        logger.info(f"Training ended: final_step={state.global_step}")
+        
+        # Final metrics from last log entry
+        metrics = {}
+        if state.log_history:
+            last_log = state.log_history[-1]
+            if "loss" in last_log:
+                metrics["loss"] = float(last_log["loss"])
+            if "learning_rate" in last_log:
+                metrics["learning_rate"] = float(last_log["learning_rate"])
+            if "epoch" in last_log:
+                metrics["epoch"] = float(last_log["epoch"])
+        
+        self.worker._update_job_status(
+            self.job_id,
+            current_step=state.global_step,
+            total_steps=state.max_steps,
+            current_epoch=float(state.epoch) if hasattr(state, "epoch") and state.epoch else None,
+            metrics=metrics if metrics else None,
+        )
+    
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        """Called after evaluation. Reports eval metrics to database."""
+        if not metrics:
+            return
+        
+        # Extract evaluation metrics
+        eval_metrics = {}
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)):
+                eval_metrics[key] = float(value)
+        
+        if eval_metrics:
+            logger.debug(f"Evaluation metrics: {eval_metrics}")
+            self.worker._update_job_status(
+                self.job_id,
+                metrics=eval_metrics,
+            )
 
 
 class GenlioWorker:
@@ -499,7 +637,6 @@ class GenlioWorker:
         try:
             # Import LLaMA-Factory training function
             from llamafactory.train.tuner import run_exp
-            from llamafactory.hparams import get_train_args
             
             # Prepare dataset
             dataset_name = self._prepare_dataset(job)
@@ -517,31 +654,14 @@ class GenlioWorker:
             
             logger.info(f"Starting training with args: {json.dumps(args, indent=2)}")
             
-            # Create a custom callback to report progress
-            class ProgressCallback:
-                def __init__(callback_self, worker, job_id):
-                    callback_self.worker = worker
-                    callback_self.job_id = job_id
-                    callback_self.last_update = 0
-                
-                def on_log(callback_self, args, state, control, logs=None, **kwargs):
-                    if logs:
-                        metrics = {
-                            "loss": logs.get("loss"),
-                            "learning_rate": logs.get("learning_rate"),
-                            "epoch": logs.get("epoch"),
-                        }
-                        callback_self.worker._update_job_status(
-                            callback_self.job_id,
-                            current_step=state.global_step if hasattr(state, 'global_step') else None,
-                            total_steps=state.max_steps if hasattr(state, 'max_steps') else None,
-                            current_epoch=logs.get("epoch"),
-                            metrics=metrics,
-                        )
+            # Create progress callback for reporting to database
+            progress_callback = GenlioProgressCallback(
+                worker=self,
+                job_id=job.job_id,
+            )
             
-            # Run training
-            # Note: LLaMA-Factory's run_exp accepts a dict of args
-            run_exp(args=args)
+            # Run training with callback
+            run_exp(args=args, callbacks=[progress_callback])
             
             # Determine adapter path
             adapter_path = output_dir
