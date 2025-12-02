@@ -130,98 +130,79 @@ class GenlioProgressCallback(TrainerCallback):
     """
     Custom TrainerCallback that reports training progress to the Genlio database.
     
-    This callback hooks into the HuggingFace Trainer lifecycle to capture:
-    - Training start/end events
-    - Step progress and timing
-    - Loss, learning rate, and other metrics
+    Records granular metrics history at each logging step for visualization:
+    - Training loss at each step
+    - Learning rate schedule
     - Epoch progress
+    - Evaluation metrics when available
     
-    It also records all metrics history and generates beautiful visualizations at the end.
+    Metrics are stored in the database as:
+    {
+        "current": { "loss": 0.5, "learning_rate": 1e-4, ... },
+        "history": [
+            { "step": 10, "loss": 2.3, "learning_rate": 1e-4, "epoch": 0.1, "timestamp": "..." },
+            ...
+        ],
+        "eval_history": [
+            { "step": 100, "eval_loss": 1.8, "timestamp": "..." },
+            ...
+        ]
+    }
     """
     
-    def __init__(self, worker: "GenlioWorker", job_id: str, output_dir: str = None):
+    def __init__(self, worker: "GenlioWorker", job_id: str):
         super().__init__()
         self.worker = worker
         self.job_id = job_id
-        self.output_dir = output_dir
-        self.last_update_time = 0.0
-        self.update_interval = 5.0  # Minimum seconds between DB updates to avoid flooding
         self.training_started = False
-        self.start_time = None
         
-        # Metrics history for tracking and visualization
-        self.metrics_history = {
-            "steps": [],
-            "epochs": [],
-            "timestamps": [],
-            "train_loss": [],
-            "eval_loss": [],
-            "learning_rate": [],
-            "grad_norm": [],
-            "train_runtime": [],
-            "train_samples_per_second": [],
-            "perplexity": [],
-        }
+        # Metrics history storage
+        self.train_history: list[dict] = []
+        self.eval_history: list[dict] = []
         
-        # Evaluation history (separate for potentially different intervals)
-        self.eval_history = {
-            "steps": [],
-            "epochs": [],
-            "eval_loss": [],
-            "eval_perplexity": [],
-        }
+        # Throttling for DB updates (history still recorded locally)
+        self.last_db_update_time = 0.0
+        self.db_update_interval = 3.0  # Update DB every 3 seconds
         
         logger.info(f"[GenlioProgressCallback] CREATED for job_id={job_id}")
     
     def __repr__(self):
         return f"GenlioProgressCallback(job_id={self.job_id})"
     
+    def _build_metrics_payload(self, current_metrics: dict) -> dict:
+        """Build the full metrics payload with current values and history."""
+        return {
+            "current": current_metrics,
+            "history": self.train_history,
+            "eval_history": self.eval_history,
+        }
+    
+    def _should_update_db(self) -> bool:
+        """Check if enough time has passed to update DB."""
+        current_time = time.time()
+        if current_time - self.last_db_update_time >= self.db_update_interval:
+            self.last_db_update_time = current_time
+            return True
+        return False
+    
     def on_init_end(self, args, state, control, **kwargs):
         """Called when trainer is initialized."""
-        logger.info("[GenlioProgressCallback] on_init_end called")
-        self.output_dir = args.output_dir
+        logger.info(f"[GenlioProgressCallback] on_init_end called")
     
     def on_train_begin(self, args, state, control, **kwargs):
-        """Called when training starts. Initializes tracking and sends initial update."""
-        logger.info("[GenlioProgressCallback] on_train_begin called!")
+        """Called when training starts. Captures total steps and epochs."""
+        logger.info(f"[GenlioProgressCallback] on_train_begin called!")
         self.training_started = True
-        self.start_time = time.time()
-        self.last_update_time = self.start_time
-        self.output_dir = args.output_dir
-        
-        # Reset history for fresh training run
-        self.metrics_history = {
-            "steps": [],
-            "epochs": [],
-            "timestamps": [],
-            "train_loss": [],
-            "eval_loss": [],
-            "learning_rate": [],
-            "grad_norm": [],
-            "train_runtime": [],
-            "train_samples_per_second": [],
-            "perplexity": [],
-        }
-        self.eval_history = {
-            "steps": [],
-            "epochs": [],
-            "eval_loss": [],
-            "eval_perplexity": [],
-        }
+        self.last_db_update_time = time.time()
         
         logger.info(f"[GenlioProgressCallback] Training started: max_steps={state.max_steps}, num_epochs={args.num_train_epochs}")
         
-        # Initialize with empty history structure for frontend
-        initial_metrics = {
-            "current": {"step": 0, "epoch": 0.0},
-            "training_history": [],
-            "eval_history": [],
-            "summary": {
-                "total_training_points": 0,
-                "total_eval_points": 0,
-            },
-            "completed": False,
-        }
+        # Initialize metrics with empty history
+        initial_metrics = self._build_metrics_payload({
+            "loss": None,
+            "learning_rate": None,
+            "epoch": 0.0,
+        })
         
         self.worker._update_job_status(
             self.job_id,
@@ -233,650 +214,161 @@ class GenlioProgressCallback(TrainerCallback):
         )
     
     def on_log(self, args, state, control, logs=None, **kwargs):
-        """Called when metrics are logged. Records all metrics and reports to database."""
+        """Called when metrics are logged. Records to history and updates database."""
         logger.info(f"[GenlioProgressCallback] on_log called! logs={logs}")
         
         if not logs:
             logger.info("[GenlioProgressCallback] on_log: no logs, returning")
             return
         
-        current_time = time.time()
         current_step = getattr(state, "global_step", 0)
-        max_steps = getattr(state, "max_steps", None)
-        epoch = logs.get("epoch", 0.0)
+        max_steps = getattr(state, "max_steps", 0)
+        timestamp = _now_iso()
         
-        # Always record metrics to history (no throttling for history)
-        self._record_metrics(current_step, epoch, current_time, logs)
+        # Extract training metrics
+        loss = logs.get("loss")
+        learning_rate = logs.get("learning_rate")
+        epoch = logs.get("epoch")
+        grad_norm = logs.get("grad_norm")
         
-        # Throttle DB updates to avoid flooding
-        time_since_last = current_time - self.last_update_time
-        if time_since_last < self.update_interval:
-            logger.info(f"[GenlioProgressCallback] on_log: DB update throttled (only {time_since_last:.1f}s since last update)")
-            return
+        # Check for eval metrics
+        eval_loss = logs.get("eval_loss")
         
-        self.last_update_time = current_time
+        # Record training metrics to history (every log event)
+        if loss is not None:
+            train_record = {
+                "step": current_step,
+                "timestamp": timestamp,
+            }
+            if loss is not None:
+                train_record["loss"] = float(loss)
+            if learning_rate is not None:
+                train_record["learning_rate"] = float(learning_rate)
+            if epoch is not None:
+                train_record["epoch"] = float(epoch)
+            if grad_norm is not None:
+                train_record["grad_norm"] = float(grad_norm)
+            
+            self.train_history.append(train_record)
+            logger.info(f"[GenlioProgressCallback] Recorded train metrics: step={current_step}, loss={loss:.4f}" if loss else f"[GenlioProgressCallback] Recorded train metrics: step={current_step}")
         
-        # Build comprehensive metrics object with FULL HISTORY for frontend visualization
-        metrics = self._build_metrics_with_history(logs)
+        # Record eval metrics to history
+        if eval_loss is not None:
+            eval_record = {
+                "step": current_step,
+                "timestamp": timestamp,
+                "eval_loss": float(eval_loss),
+            }
+            # Add any other eval metrics
+            for key, value in logs.items():
+                if key.startswith("eval_") and key != "eval_loss" and isinstance(value, (int, float)):
+                    eval_record[key] = float(value)
+            
+            self.eval_history.append(eval_record)
+            logger.info(f"[GenlioProgressCallback] Recorded eval metrics: step={current_step}, eval_loss={eval_loss:.4f}")
         
-        logger.info(
-            f"[GenlioProgressCallback] Progress update: step={current_step}/{max_steps}, "
-            f"epoch={epoch}, loss={logs.get('loss')}, lr={logs.get('learning_rate')}, "
-            f"history_len={len(self.metrics_history['steps'])}"
-        )
+        # Build current metrics
+        current_metrics = {}
+        if loss is not None:
+            current_metrics["loss"] = float(loss)
+        if learning_rate is not None:
+            current_metrics["learning_rate"] = float(learning_rate)
+        if epoch is not None:
+            current_metrics["epoch"] = float(epoch)
+        if grad_norm is not None:
+            current_metrics["grad_norm"] = float(grad_norm)
+        if eval_loss is not None:
+            current_metrics["eval_loss"] = float(eval_loss)
         
-        self.worker._update_job_status(
-            self.job_id,
-            current_step=current_step,
-            total_steps=max_steps,
-            current_epoch=float(epoch) if epoch is not None else None,
-            metrics=metrics,
-        )
+        # Update DB with throttling
+        if self._should_update_db():
+            metrics_payload = self._build_metrics_payload(current_metrics)
+            
+            logger.info(
+                f"[GenlioProgressCallback] DB update: step={current_step}/{max_steps}, "
+                f"history_len={len(self.train_history)}, eval_history_len={len(self.eval_history)}"
+            )
+            
+            self.worker._update_job_status(
+                self.job_id,
+                current_step=current_step,
+                total_steps=max_steps,
+                current_epoch=float(epoch) if epoch is not None else None,
+                metrics=metrics_payload,
+            )
     
     def on_step_end(self, args, state, control, **kwargs):
         """Called at the end of each training step."""
-        # Log every 50 steps to avoid spam
-        if state.global_step % 50 == 0:
+        # Log every 100 steps to avoid spam
+        if state.global_step % 100 == 0:
             logger.info(f"[GenlioProgressCallback] on_step_end: step={state.global_step}")
     
-    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        """Called after evaluation. Records eval metrics and reports to database."""
-        logger.info(f"[GenlioProgressCallback] on_evaluate called! metrics={metrics}")
-        
-        if not metrics:
-            return
-        
-        current_step = getattr(state, "global_step", 0)
-        epoch = getattr(state, "epoch", 0.0)
-        
-        # Record eval metrics
-        self.eval_history["steps"].append(current_step)
-        self.eval_history["epochs"].append(epoch)
-        
-        eval_loss = metrics.get("eval_loss")
-        if eval_loss is not None:
-            self.eval_history["eval_loss"].append(float(eval_loss))
-            # Calculate perplexity from loss
-            import math
-            try:
-                perplexity = math.exp(eval_loss)
-                self.eval_history["eval_perplexity"].append(perplexity)
-            except (OverflowError, ValueError):
-                self.eval_history["eval_perplexity"].append(None)
-        
-        # Extract all numeric eval metrics
-        eval_metrics = {}
-        for key, value in metrics.items():
-            if isinstance(value, (int, float)):
-                eval_metrics[key] = float(value)
-        
-        if eval_metrics:
-            logger.info(f"[GenlioProgressCallback] Evaluation metrics: {eval_metrics}")
-            self.worker._update_job_status(
-                self.job_id,
-                metrics=eval_metrics,
-            )
-    
     def on_train_end(self, args, state, control, **kwargs):
-        """Called when training ends. Generates visualizations and final update."""
-        logger.info("[GenlioProgressCallback] on_train_end called!")
-        
+        """Called when training ends. Final update with complete history."""
+        logger.info(f"[GenlioProgressCallback] on_train_end called!")
         if not self.training_started:
             logger.info("[GenlioProgressCallback] on_train_end: training not started, returning")
             return
         
-        total_time = time.time() - self.start_time if self.start_time else 0
-        logger.info(
-            f"[GenlioProgressCallback] Training ended: final_step={state.global_step}, "
-            f"total_time={total_time:.1f}s, training_points={len(self.metrics_history['steps'])}, "
-            f"eval_points={len(self.eval_history['steps'])}"
-        )
+        logger.info(f"[GenlioProgressCallback] Training ended: final_step={state.global_step}, "
+                   f"total_train_records={len(self.train_history)}, total_eval_records={len(self.eval_history)}")
         
-        # Generate visualizations
-        try:
-            self._generate_training_report(state)
-        except Exception as e:
-            logger.exception(f"[GenlioProgressCallback] Failed to generate training report: {e}")
+        # Build final current metrics from last log entry
+        current_metrics = {}
+        if state.log_history:
+            last_log = state.log_history[-1]
+            if "loss" in last_log:
+                current_metrics["loss"] = float(last_log["loss"])
+            if "learning_rate" in last_log:
+                current_metrics["learning_rate"] = float(last_log["learning_rate"])
+            if "epoch" in last_log:
+                current_metrics["epoch"] = float(last_log["epoch"])
         
-        # Save metrics history to JSON file
-        try:
-            self._save_metrics_history()
-        except Exception as e:
-            logger.exception(f"[GenlioProgressCallback] Failed to save metrics history: {e}")
-        
-        # Build final comprehensive metrics with complete history
-        final_metrics = self._build_final_metrics(state, total_time)
+        # Final DB update with complete history
+        metrics_payload = self._build_metrics_payload(current_metrics)
         
         self.worker._update_job_status(
             self.job_id,
             current_step=state.global_step,
             total_steps=state.max_steps,
             current_epoch=float(state.epoch) if hasattr(state, "epoch") and state.epoch else None,
-            metrics=final_metrics,
+            metrics=metrics_payload,
         )
     
-    def _record_metrics(self, step: int, epoch: float, timestamp: float, logs: dict):
-        """Record metrics to history for later visualization."""
-        self.metrics_history["steps"].append(step)
-        self.metrics_history["epochs"].append(epoch)
-        self.metrics_history["timestamps"].append(timestamp - (self.start_time or timestamp))
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        """Called after evaluation. Records eval metrics to history."""
+        logger.info(f"[GenlioProgressCallback] on_evaluate called! metrics={metrics}")
         
-        # Training loss
-        loss = logs.get("loss")
-        if loss is not None:
-            self.metrics_history["train_loss"].append(float(loss))
-        else:
-            self.metrics_history["train_loss"].append(None)
-        
-        # Learning rate
-        lr = logs.get("learning_rate")
-        if lr is not None:
-            self.metrics_history["learning_rate"].append(float(lr))
-        else:
-            self.metrics_history["learning_rate"].append(None)
-        
-        # Gradient norm
-        grad_norm = logs.get("grad_norm")
-        if grad_norm is not None:
-            self.metrics_history["grad_norm"].append(float(grad_norm))
-        else:
-            self.metrics_history["grad_norm"].append(None)
-        
-        # Eval loss (if present in training logs)
-        eval_loss = logs.get("eval_loss")
-        if eval_loss is not None:
-            self.metrics_history["eval_loss"].append(float(eval_loss))
-        else:
-            self.metrics_history["eval_loss"].append(None)
-        
-        # Calculate perplexity from training loss
-        if loss is not None:
-            import math
-            try:
-                perplexity = math.exp(loss)
-                self.metrics_history["perplexity"].append(perplexity)
-            except (OverflowError, ValueError):
-                self.metrics_history["perplexity"].append(None)
-        else:
-            self.metrics_history["perplexity"].append(None)
-    
-    def _extract_metrics(self, logs: dict) -> dict:
-        """Extract metrics from logs for database update."""
-        metrics = {}
-        
-        metric_keys = [
-            "loss", "learning_rate", "epoch", "grad_norm",
-            "eval_loss", "train_runtime", "train_samples_per_second",
-        ]
-        
-        for key in metric_keys:
-            value = logs.get(key)
-            if value is not None:
-                metrics[key] = float(value)
-        
-        return metrics
-    
-    def _build_metrics_with_history(self, logs: dict) -> dict:
-        """Build comprehensive metrics object with full history for frontend visualization.
-        
-        Returns a structure optimized for frontend charting:
-        {
-            "current": {...},           # Latest values for quick display
-            "training_history": [...],  # Array of {step, loss, lr, epoch, ...} records
-            "eval_history": [...],      # Array of {step, loss, epoch, ...} records
-            "summary": {...}            # Aggregate stats
-        }
-        """
-        # Build training history as array of records (frontend-friendly format)
-        training_records = []
-        for i, step in enumerate(self.metrics_history["steps"]):
-            record = {"step": step}
-            
-            if i < len(self.metrics_history["epochs"]) and self.metrics_history["epochs"][i] is not None:
-                record["epoch"] = round(self.metrics_history["epochs"][i], 4)
-            
-            if i < len(self.metrics_history["timestamps"]) and self.metrics_history["timestamps"][i] is not None:
-                record["elapsed_seconds"] = round(self.metrics_history["timestamps"][i], 1)
-            
-            if i < len(self.metrics_history["train_loss"]) and self.metrics_history["train_loss"][i] is not None:
-                record["loss"] = round(self.metrics_history["train_loss"][i], 6)
-            
-            if i < len(self.metrics_history["learning_rate"]) and self.metrics_history["learning_rate"][i] is not None:
-                record["learning_rate"] = self.metrics_history["learning_rate"][i]
-            
-            if i < len(self.metrics_history["grad_norm"]) and self.metrics_history["grad_norm"][i] is not None:
-                record["grad_norm"] = round(self.metrics_history["grad_norm"][i], 6)
-            
-            if i < len(self.metrics_history["perplexity"]) and self.metrics_history["perplexity"][i] is not None:
-                record["perplexity"] = round(self.metrics_history["perplexity"][i], 4)
-            
-            training_records.append(record)
-        
-        # Build eval history as array of records
-        eval_records = []
-        for i, step in enumerate(self.eval_history["steps"]):
-            record = {"step": step}
-            
-            if i < len(self.eval_history["epochs"]) and self.eval_history["epochs"][i] is not None:
-                record["epoch"] = round(self.eval_history["epochs"][i], 4)
-            
-            if i < len(self.eval_history["eval_loss"]) and self.eval_history["eval_loss"][i] is not None:
-                record["loss"] = round(self.eval_history["eval_loss"][i], 6)
-            
-            if i < len(self.eval_history["eval_perplexity"]) and self.eval_history["eval_perplexity"][i] is not None:
-                record["perplexity"] = round(self.eval_history["eval_perplexity"][i], 4)
-            
-            eval_records.append(record)
-        
-        # Current values (latest snapshot)
-        current = self._extract_metrics(logs)
-        
-        # Calculate summary statistics
-        train_losses = [r["loss"] for r in training_records if "loss" in r]
-        summary = {
-            "total_training_points": len(training_records),
-            "total_eval_points": len(eval_records),
-        }
-        
-        if train_losses:
-            summary["latest_loss"] = train_losses[-1]
-            summary["min_loss"] = min(train_losses)
-            summary["avg_loss"] = round(sum(train_losses) / len(train_losses), 6)
-        
-        eval_losses = [r["loss"] for r in eval_records if "loss" in r]
-        if eval_losses:
-            summary["latest_eval_loss"] = eval_losses[-1]
-            summary["min_eval_loss"] = min(eval_losses)
-        
-        return {
-            "current": current,
-            "training_history": training_records,
-            "eval_history": eval_records,
-            "summary": summary,
-        }
-    
-    def _extract_final_metrics(self, state) -> dict:
-        """Extract final metrics from trainer state."""
-        metrics = {}
-        
-        if state.log_history:
-            # Get the last few entries to find final metrics
-            for log_entry in reversed(state.log_history):
-                for key in ["loss", "learning_rate", "epoch", "train_loss", "eval_loss"]:
-                    if key in log_entry and key not in metrics:
-                        metrics[key] = float(log_entry[key])
-        
-        # Add summary stats
-        train_losses = [x for x in self.metrics_history["train_loss"] if x is not None]
-        if train_losses:
-            metrics["final_train_loss"] = train_losses[-1]
-            metrics["min_train_loss"] = min(train_losses)
-            metrics["avg_train_loss"] = sum(train_losses) / len(train_losses)
-        
-        eval_losses = [x for x in self.eval_history["eval_loss"] if x is not None]
-        if eval_losses:
-            metrics["final_eval_loss"] = eval_losses[-1]
-            metrics["min_eval_loss"] = min(eval_losses)
-        
-        return metrics
-    
-    def _build_final_metrics(self, state, total_time: float) -> dict:
-        """Build final comprehensive metrics object with complete training history.
-        
-        This is the complete snapshot saved at training end, optimized for 
-        frontend visualization with full history and summary statistics.
-        """
-        # Build training history as array of records
-        training_records = []
-        for i, step in enumerate(self.metrics_history["steps"]):
-            record = {"step": step}
-            
-            if i < len(self.metrics_history["epochs"]) and self.metrics_history["epochs"][i] is not None:
-                record["epoch"] = round(self.metrics_history["epochs"][i], 4)
-            
-            if i < len(self.metrics_history["timestamps"]) and self.metrics_history["timestamps"][i] is not None:
-                record["elapsed_seconds"] = round(self.metrics_history["timestamps"][i], 1)
-            
-            if i < len(self.metrics_history["train_loss"]) and self.metrics_history["train_loss"][i] is not None:
-                record["loss"] = round(self.metrics_history["train_loss"][i], 6)
-            
-            if i < len(self.metrics_history["learning_rate"]) and self.metrics_history["learning_rate"][i] is not None:
-                record["learning_rate"] = self.metrics_history["learning_rate"][i]
-            
-            if i < len(self.metrics_history["grad_norm"]) and self.metrics_history["grad_norm"][i] is not None:
-                record["grad_norm"] = round(self.metrics_history["grad_norm"][i], 6)
-            
-            if i < len(self.metrics_history["perplexity"]) and self.metrics_history["perplexity"][i] is not None:
-                record["perplexity"] = round(self.metrics_history["perplexity"][i], 4)
-            
-            training_records.append(record)
-        
-        # Build eval history as array of records
-        eval_records = []
-        for i, step in enumerate(self.eval_history["steps"]):
-            record = {"step": step}
-            
-            if i < len(self.eval_history["epochs"]) and self.eval_history["epochs"][i] is not None:
-                record["epoch"] = round(self.eval_history["epochs"][i], 4)
-            
-            if i < len(self.eval_history["eval_loss"]) and self.eval_history["eval_loss"][i] is not None:
-                record["loss"] = round(self.eval_history["eval_loss"][i], 6)
-            
-            if i < len(self.eval_history["eval_perplexity"]) and self.eval_history["eval_perplexity"][i] is not None:
-                record["perplexity"] = round(self.eval_history["eval_perplexity"][i], 4)
-            
-            eval_records.append(record)
-        
-        # Calculate comprehensive summary statistics
-        train_losses = [r["loss"] for r in training_records if "loss" in r]
-        eval_losses = [r["loss"] for r in eval_records if "loss" in r]
-        learning_rates = [r["learning_rate"] for r in training_records if "learning_rate" in r]
-        grad_norms = [r["grad_norm"] for r in training_records if "grad_norm" in r]
-        
-        summary = {
-            "total_training_points": len(training_records),
-            "total_eval_points": len(eval_records),
-            "total_time_seconds": round(total_time, 1),
-            "final_step": state.global_step,
-            "final_epoch": float(state.epoch) if hasattr(state, "epoch") and state.epoch else None,
-        }
-        
-        if train_losses:
-            summary["final_loss"] = train_losses[-1]
-            summary["min_loss"] = min(train_losses)
-            summary["max_loss"] = max(train_losses)
-            summary["avg_loss"] = round(sum(train_losses) / len(train_losses), 6)
-            # Loss improvement percentage
-            if len(train_losses) > 1:
-                summary["loss_improvement_pct"] = round(
-                    (train_losses[0] - train_losses[-1]) / train_losses[0] * 100, 2
-                )
-        
-        if eval_losses:
-            summary["final_eval_loss"] = eval_losses[-1]
-            summary["min_eval_loss"] = min(eval_losses)
-            summary["best_eval_step"] = eval_records[eval_losses.index(min(eval_losses))]["step"]
-        
-        if learning_rates:
-            summary["initial_lr"] = learning_rates[0]
-            summary["final_lr"] = learning_rates[-1]
-        
-        if grad_norms:
-            summary["avg_grad_norm"] = round(sum(grad_norms) / len(grad_norms), 6)
-            summary["max_grad_norm"] = round(max(grad_norms), 6)
-        
-        # Current/final values for quick access
-        current = {}
-        if training_records:
-            current = training_records[-1].copy()
-        
-        return {
-            "current": current,
-            "training_history": training_records,
-            "eval_history": eval_records,
-            "summary": summary,
-            "completed": True,
-        }
-    
-    def _save_metrics_history(self):
-        """Save all metrics history to a JSON file."""
-        if not self.output_dir:
-            logger.warning("[GenlioProgressCallback] No output_dir set, skipping metrics history save")
+        if not metrics:
             return
         
-        output_path = Path(self.output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
+        current_step = getattr(state, "global_step", 0)
+        timestamp = _now_iso()
         
-        history_file = output_path / "genlio_metrics_history.json"
-        
-        history_data = {
-            "job_id": self.job_id,
-            "training_metrics": self.metrics_history,
-            "evaluation_metrics": self.eval_history,
-            "summary": {
-                "total_steps": len(self.metrics_history["steps"]),
-                "total_evals": len(self.eval_history["steps"]),
-            }
+        # Build eval record
+        eval_record = {
+            "step": current_step,
+            "timestamp": timestamp,
         }
         
-        with open(history_file, "w") as f:
-            json.dump(history_data, f, indent=2, default=str)
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)):
+                eval_record[key] = float(value)
         
-        logger.info(f"[GenlioProgressCallback] Metrics history saved to {history_file}")
-    
-    def _generate_training_report(self, state):
-        """Generate beautiful training visualizations."""
-        try:
-            import matplotlib
-            matplotlib.use('Agg')  # Non-interactive backend
-            import matplotlib.pyplot as plt
-            from matplotlib.gridspec import GridSpec
-            import numpy as np
-        except ImportError:
-            logger.warning("[GenlioProgressCallback] matplotlib not available, skipping visualization")
-            return
-        
-        if not self.output_dir:
-            logger.warning("[GenlioProgressCallback] No output_dir set, skipping visualization")
-            return
-        
-        output_path = Path(self.output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-        
-        # Filter out None values for plotting
-        steps = self.metrics_history["steps"]
-        train_loss = self.metrics_history["train_loss"]
-        learning_rate = self.metrics_history["learning_rate"]
-        grad_norm = self.metrics_history["grad_norm"]
-        perplexity = self.metrics_history["perplexity"]
-        
-        # Create figure with custom style
-        plt.style.use('dark_background')
-        
-        # Define color palette (vibrant, modern colors)
-        colors = {
-            'train_loss': '#FF6B6B',      # Coral red
-            'eval_loss': '#4ECDC4',        # Teal
-            'learning_rate': '#FFE66D',    # Yellow
-            'grad_norm': '#95E1D3',        # Mint
-            'perplexity': '#F38181',       # Salmon
-            'background': '#1a1a2e',       # Dark blue-black
-            'grid': '#16213e',             # Darker blue
-            'text': '#eaeaea',             # Light gray
-            'accent': '#e94560',           # Hot pink
-        }
-        
-        fig = plt.figure(figsize=(16, 12), facecolor=colors['background'])
-        fig.suptitle(f'🚀 Training Report - Job: {self.job_id}', 
-                     fontsize=20, fontweight='bold', color=colors['text'], y=0.98)
-        
-        gs = GridSpec(3, 2, figure=fig, hspace=0.35, wspace=0.25)
-        
-        # 1. Training Loss Plot (main, larger)
-        ax1 = fig.add_subplot(gs[0, :])
-        ax1.set_facecolor(colors['background'])
-        
-        valid_train = [(s, l) for s, l in zip(steps, train_loss) if l is not None]
-        if valid_train:
-            s_train, l_train = zip(*valid_train)
-            ax1.plot(s_train, l_train, color=colors['train_loss'], linewidth=2, label='Training Loss', alpha=0.9)
+        if len(eval_record) > 2:  # Has more than just step and timestamp
+            self.eval_history.append(eval_record)
+            logger.info(f"[GenlioProgressCallback] Recorded evaluation: step={current_step}, metrics={eval_record}")
             
-            # Add smoothed line
-            if len(l_train) > 10:
-                window = min(len(l_train) // 5, 50)
-                if window > 1:
-                    smoothed = np.convolve(l_train, np.ones(window)/window, mode='valid')
-                    ax1.plot(s_train[window-1:], smoothed, color=colors['train_loss'], 
-                            linewidth=3, alpha=0.5, linestyle='--', label='Smoothed')
-        
-        # Add eval loss if available
-        if self.eval_history["steps"] and self.eval_history["eval_loss"]:
-            valid_eval = [(s, l) for s, l in zip(self.eval_history["steps"], self.eval_history["eval_loss"]) if l is not None]
-            if valid_eval:
-                s_eval, l_eval = zip(*valid_eval)
-                ax1.scatter(s_eval, l_eval, color=colors['eval_loss'], s=100, zorder=5, 
-                           label='Eval Loss', edgecolors='white', linewidth=2)
-                ax1.plot(s_eval, l_eval, color=colors['eval_loss'], linewidth=2, alpha=0.7, linestyle=':')
-        
-        ax1.set_xlabel('Steps', fontsize=12, color=colors['text'])
-        ax1.set_ylabel('Loss', fontsize=12, color=colors['text'])
-        ax1.set_title('📉 Training & Evaluation Loss', fontsize=14, fontweight='bold', color=colors['text'], pad=10)
-        ax1.legend(loc='upper right', facecolor=colors['grid'], edgecolor=colors['accent'])
-        ax1.grid(True, alpha=0.3, color=colors['grid'])
-        ax1.tick_params(colors=colors['text'])
-        
-        # 2. Learning Rate Schedule
-        ax2 = fig.add_subplot(gs[1, 0])
-        ax2.set_facecolor(colors['background'])
-        
-        valid_lr = [(s, lr) for s, lr in zip(steps, learning_rate) if lr is not None]
-        if valid_lr:
-            s_lr, l_lr = zip(*valid_lr)
-            ax2.plot(s_lr, l_lr, color=colors['learning_rate'], linewidth=2)
-            ax2.fill_between(s_lr, l_lr, alpha=0.3, color=colors['learning_rate'])
-        
-        ax2.set_xlabel('Steps', fontsize=12, color=colors['text'])
-        ax2.set_ylabel('Learning Rate', fontsize=12, color=colors['text'])
-        ax2.set_title('📈 Learning Rate Schedule', fontsize=14, fontweight='bold', color=colors['text'], pad=10)
-        ax2.grid(True, alpha=0.3, color=colors['grid'])
-        ax2.tick_params(colors=colors['text'])
-        ax2.ticklabel_format(style='scientific', axis='y', scilimits=(0,0))
-        
-        # 3. Gradient Norm
-        ax3 = fig.add_subplot(gs[1, 1])
-        ax3.set_facecolor(colors['background'])
-        
-        valid_gn = [(s, gn) for s, gn in zip(steps, grad_norm) if gn is not None]
-        if valid_gn:
-            s_gn, l_gn = zip(*valid_gn)
-            ax3.plot(s_gn, l_gn, color=colors['grad_norm'], linewidth=1.5, alpha=0.7)
+            # Force DB update after evaluation
+            self.last_db_update_time = 0  # Reset to force update
+            current_metrics = {"eval_step": current_step}
+            current_metrics.update({k: v for k, v in eval_record.items() if k not in ["step", "timestamp"]})
             
-            # Add mean line
-            mean_gn = sum(l_gn) / len(l_gn)
-            ax3.axhline(y=mean_gn, color=colors['accent'], linestyle='--', linewidth=2, label=f'Mean: {mean_gn:.2f}')
-            ax3.legend(loc='upper right', facecolor=colors['grid'], edgecolor=colors['accent'])
-        
-        ax3.set_xlabel('Steps', fontsize=12, color=colors['text'])
-        ax3.set_ylabel('Gradient Norm', fontsize=12, color=colors['text'])
-        ax3.set_title('📊 Gradient Norm', fontsize=14, fontweight='bold', color=colors['text'], pad=10)
-        ax3.grid(True, alpha=0.3, color=colors['grid'])
-        ax3.tick_params(colors=colors['text'])
-        
-        # 4. Perplexity
-        ax4 = fig.add_subplot(gs[2, 0])
-        ax4.set_facecolor(colors['background'])
-        
-        valid_ppl = [(s, p) for s, p in zip(steps, perplexity) if p is not None and p < 1e6]  # Filter outliers
-        if valid_ppl:
-            s_ppl, l_ppl = zip(*valid_ppl)
-            ax4.semilogy(s_ppl, l_ppl, color=colors['perplexity'], linewidth=2)
-        
-        ax4.set_xlabel('Steps', fontsize=12, color=colors['text'])
-        ax4.set_ylabel('Perplexity (log scale)', fontsize=12, color=colors['text'])
-        ax4.set_title('🎯 Perplexity', fontsize=14, fontweight='bold', color=colors['text'], pad=10)
-        ax4.grid(True, alpha=0.3, color=colors['grid'])
-        ax4.tick_params(colors=colors['text'])
-        
-        # 5. Summary Stats Box
-        ax5 = fig.add_subplot(gs[2, 1])
-        ax5.set_facecolor(colors['background'])
-        ax5.axis('off')
-        
-        # Calculate summary statistics
-        stats_text = self._generate_stats_text()
-        
-        # Create a styled text box
-        props = dict(boxstyle='round,pad=0.5', facecolor=colors['grid'], edgecolor=colors['accent'], linewidth=2)
-        ax5.text(0.5, 0.5, stats_text, transform=ax5.transAxes, fontsize=12,
-                verticalalignment='center', horizontalalignment='center',
-                fontfamily='monospace', color=colors['text'], bbox=props)
-        ax5.set_title('📋 Training Summary', fontsize=14, fontweight='bold', color=colors['text'], pad=10)
-        
-        # Save the figure
-        plot_file = output_path / "genlio_training_report.png"
-        plt.savefig(plot_file, dpi=150, bbox_inches='tight', facecolor=colors['background'], edgecolor='none')
-        plt.close(fig)
-        
-        logger.info(f"[GenlioProgressCallback] Training report saved to {plot_file}")
-        
-        # Also generate a simple loss comparison plot
-        self._generate_loss_comparison_plot(output_path, colors)
-    
-    def _generate_stats_text(self) -> str:
-        """Generate summary statistics text for the report."""
-        train_losses = [x for x in self.metrics_history["train_loss"] if x is not None]
-        eval_losses = [x for x in self.eval_history["eval_loss"] if x is not None]
-        
-        lines = ["═" * 35]
-        lines.append("       TRAINING STATISTICS")
-        lines.append("═" * 35)
-        
-        lines.append(f"  Total Steps:      {len(self.metrics_history['steps']):>10}")
-        lines.append(f"  Total Evals:      {len(self.eval_history['steps']):>10}")
-        
-        if train_losses:
-            lines.append("")
-            lines.append("  Training Loss:")
-            lines.append(f"    Initial:        {train_losses[0]:>10.4f}")
-            lines.append(f"    Final:          {train_losses[-1]:>10.4f}")
-            lines.append(f"    Min:            {min(train_losses):>10.4f}")
-            lines.append(f"    Improvement:    {((train_losses[0] - train_losses[-1]) / train_losses[0] * 100):>9.1f}%")
-        
-        if eval_losses:
-            lines.append("")
-            lines.append("  Eval Loss:")
-            lines.append(f"    Best:           {min(eval_losses):>10.4f}")
-            lines.append(f"    Final:          {eval_losses[-1]:>10.4f}")
-        
-        total_time = self.metrics_history["timestamps"][-1] if self.metrics_history["timestamps"] else 0
-        lines.append("")
-        lines.append(f"  Training Time:    {total_time/60:>9.1f}m")
-        lines.append("═" * 35)
-        
-        return "\n".join(lines)
-    
-    def _generate_loss_comparison_plot(self, output_path: Path, colors: dict):
-        """Generate a clean loss comparison plot."""
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        
-        fig, ax = plt.subplots(figsize=(10, 6), facecolor=colors['background'])
-        ax.set_facecolor(colors['background'])
-        
-        steps = self.metrics_history["steps"]
-        train_loss = self.metrics_history["train_loss"]
-        
-        # Training loss
-        valid_train = [(s, l) for s, l in zip(steps, train_loss) if l is not None]
-        if valid_train:
-            s_train, l_train = zip(*valid_train)
-            ax.plot(s_train, l_train, color=colors['train_loss'], linewidth=2, 
-                   label='Training Loss', alpha=0.8)
-        
-        # Eval loss
-        if self.eval_history["steps"] and self.eval_history["eval_loss"]:
-            valid_eval = [(s, l) for s, l in zip(self.eval_history["steps"], self.eval_history["eval_loss"]) if l is not None]
-            if valid_eval:
-                s_eval, l_eval = zip(*valid_eval)
-                ax.plot(s_eval, l_eval, color=colors['eval_loss'], linewidth=2.5, 
-                       label='Eval Loss', marker='o', markersize=8)
-        
-        ax.set_xlabel('Steps', fontsize=14, color=colors['text'])
-        ax.set_ylabel('Loss', fontsize=14, color=colors['text'])
-        ax.set_title(f'Training Progress - {self.job_id}', fontsize=16, fontweight='bold', color=colors['text'])
-        ax.legend(loc='upper right', facecolor=colors['grid'], edgecolor=colors['accent'], fontsize=12)
-        ax.grid(True, alpha=0.3, color=colors['grid'])
-        ax.tick_params(colors=colors['text'], labelsize=12)
-        
-        for spine in ax.spines.values():
-            spine.set_color(colors['grid'])
-        
-        plot_file = output_path / "genlio_loss_curve.png"
-        plt.savefig(plot_file, dpi=150, bbox_inches='tight', facecolor=colors['background'], edgecolor='none')
-        plt.close(fig)
-        
-        logger.info(f"[GenlioProgressCallback] Loss curve saved to {plot_file}")
+            metrics_payload = self._build_metrics_payload(current_metrics)
+            self.worker._update_job_status(
+                self.job_id,
+                metrics=metrics_payload,
+            )
 
 
 class GenlioWorker:
