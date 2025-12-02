@@ -52,6 +52,7 @@ logging.basicConfig(
 logger = logging.getLogger("genlio_worker")
 
 STORAGE_BUCKET = "datasets"
+ADAPTERS_BUCKET = "adapters"
 
 Base = declarative_base()
 
@@ -244,6 +245,79 @@ class GenlioWorker:
         response = self.http_client.get(url, headers=headers)
         response.raise_for_status()
         return response.content
+
+    def _upload_to_supabase(self, bucket: str, storage_path: str, file_content: bytes, content_type: str = "application/octet-stream") -> str:
+        """Upload a file to Supabase storage."""
+        url = f"{self.config.supabase_url}/storage/v1/object/{bucket}/{storage_path}"
+        headers = {
+            "Authorization": f"Bearer {self.config.supabase_key}",
+            "apikey": self.config.supabase_key,
+            "Content-Type": content_type,
+        }
+        
+        response = self.http_client.post(url, headers=headers, content=file_content)
+        
+        # If file exists, try upsert
+        if response.status_code == 400:
+            response = self.http_client.put(url, headers=headers, content=file_content)
+        
+        response.raise_for_status()
+        return storage_path
+
+    def _upload_adapter_to_storage(self, job: FineTuningJob, local_adapter_path: str) -> str:
+        """Upload adapter files to Supabase storage.
+        
+        Returns the storage path prefix where adapters are uploaded.
+        """
+        adapter_dir = Path(local_adapter_path)
+        storage_prefix = f"{job.dataset_id}/{job.job_id}"
+        
+        # Files to upload (essential adapter files)
+        essential_patterns = [
+            "adapter_config.json",
+            "adapter_model.safetensors",
+            "adapter_model.bin",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "training_args.bin",
+        ]
+        
+        uploaded_files = []
+        
+        for file_path in adapter_dir.iterdir():
+            if not file_path.is_file():
+                continue
+                
+            # Upload essential files or any .json/.safetensors/.bin files
+            should_upload = (
+                file_path.name in essential_patterns or
+                file_path.suffix in [".json", ".safetensors", ".bin"]
+            )
+            
+            if should_upload:
+                storage_path = f"{storage_prefix}/{file_path.name}"
+                
+                # Determine content type
+                content_type = "application/octet-stream"
+                if file_path.suffix == ".json":
+                    content_type = "application/json"
+                
+                logger.info(f"Uploading {file_path.name} to storage...")
+                
+                with open(file_path, "rb") as f:
+                    file_content = f.read()
+                
+                self._upload_to_supabase(
+                    ADAPTERS_BUCKET,
+                    storage_path,
+                    file_content,
+                    content_type,
+                )
+                uploaded_files.append(file_path.name)
+        
+        logger.info(f"Uploaded {len(uploaded_files)} adapter files to {storage_prefix}")
+        return storage_prefix
 
     def _get_dataset_storage_path(self, job: FineTuningJob) -> Optional[str]:
         """Get the storage path for a dataset from the jobs table."""
@@ -498,10 +572,24 @@ class GenlioWorker:
             success, result = self._run_training(job)
             
             if success:
+                local_adapter_path = result
+                
+                # Upload adapters to storage
+                try:
+                    logger.info(f"Uploading adapters to storage...")
+                    storage_path = self._upload_adapter_to_storage(job, local_adapter_path)
+                    adapter_path = storage_path
+                    logger.info(f"Adapters uploaded to: {storage_path}")
+                except Exception as upload_error:
+                    logger.exception(f"Failed to upload adapters: {upload_error}")
+                    # Fall back to local path if upload fails
+                    adapter_path = local_adapter_path
+                    logger.warning(f"Using local adapter path: {adapter_path}")
+                
                 self._update_job_status(
                     job.job_id,
                     status="succeeded",
-                    adapter_path=result,
+                    adapter_path=adapter_path,
                     completed_at=_now_iso(),
                 )
                 logger.info(f"Job {job.job_id} completed successfully")
