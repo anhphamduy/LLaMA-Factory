@@ -689,6 +689,12 @@ class GenlioWorker:
         output_dir = self.config.output_dir / job.job_id
         output_dir.mkdir(parents=True, exist_ok=True)
         
+        # Evaluation settings with defaults
+        do_eval = training_config.get("do_eval", True)  # Enable eval by default
+        eval_strategy = training_config.get("eval_strategy", "steps")
+        eval_steps = training_config.get("eval_steps", 100)  # Eval every 100 steps by default
+        val_size = training_config.get("val_size", 0.1)  # 10% validation split by default
+        
         args = {
             # Model
             "model_name_or_path": job.base_model,
@@ -728,6 +734,14 @@ class GenlioWorker:
             # Reporting
             "report_to": "none",
         }
+        
+        # Add evaluation settings if enabled
+        if do_eval:
+            args["do_eval"] = True
+            args["eval_strategy"] = eval_strategy
+            args["eval_steps"] = eval_steps
+            args["val_size"] = val_size  # LLaMA-Factory will split the dataset
+            args["per_device_eval_batch_size"] = training_config.get("per_device_eval_batch_size", 1)
         
         # Add LoRA config if using LoRA
         if job.finetuning_type == "lora":
