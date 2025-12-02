@@ -144,13 +144,22 @@ class GenlioProgressCallback(TrainerCallback):
         self.last_update_time = 0.0
         self.update_interval = 5.0  # Minimum seconds between DB updates to avoid flooding
         self.training_started = False
+        logger.info(f"[GenlioProgressCallback] CREATED for job_id={job_id}")
+    
+    def __repr__(self):
+        return f"GenlioProgressCallback(job_id={self.job_id})"
+    
+    def on_init_end(self, args, state, control, **kwargs):
+        """Called when trainer is initialized."""
+        logger.info(f"[GenlioProgressCallback] on_init_end called")
     
     def on_train_begin(self, args, state, control, **kwargs):
         """Called when training starts. Captures total steps and epochs."""
+        logger.info(f"[GenlioProgressCallback] on_train_begin called!")
         self.training_started = True
         self.last_update_time = time.time()
         
-        logger.info(f"Training started: max_steps={state.max_steps}, num_epochs={args.num_train_epochs}")
+        logger.info(f"[GenlioProgressCallback] Training started: max_steps={state.max_steps}, num_epochs={args.num_train_epochs}")
         
         self.worker._update_job_status(
             self.job_id,
@@ -162,13 +171,18 @@ class GenlioProgressCallback(TrainerCallback):
     
     def on_log(self, args, state, control, logs=None, **kwargs):
         """Called when metrics are logged. Reports progress and metrics to database."""
+        logger.info(f"[GenlioProgressCallback] on_log called! logs={logs}")
+        
         if not logs:
+            logger.info("[GenlioProgressCallback] on_log: no logs, returning")
             return
         
         current_time = time.time()
+        time_since_last = current_time - self.last_update_time
         
         # Throttle updates to avoid database flooding
-        if current_time - self.last_update_time < self.update_interval:
+        if time_since_last < self.update_interval:
+            logger.info(f"[GenlioProgressCallback] on_log: throttled (only {time_since_last:.1f}s since last update)")
             return
         
         self.last_update_time = current_time
@@ -199,8 +213,8 @@ class GenlioProgressCallback(TrainerCallback):
         current_step = getattr(state, "global_step", None)
         max_steps = getattr(state, "max_steps", None)
         
-        logger.debug(
-            f"Progress update: step={current_step}/{max_steps}, "
+        logger.info(
+            f"[GenlioProgressCallback] Progress update: step={current_step}/{max_steps}, "
             f"epoch={epoch}, loss={loss}, lr={learning_rate}"
         )
         
@@ -214,16 +228,18 @@ class GenlioProgressCallback(TrainerCallback):
     
     def on_step_end(self, args, state, control, **kwargs):
         """Called at the end of each training step."""
-        # We primarily report on on_log which happens every logging_steps
-        # This hook is available for more granular tracking if needed
-        pass
+        # Log every 50 steps to avoid spam
+        if state.global_step % 50 == 0:
+            logger.info(f"[GenlioProgressCallback] on_step_end: step={state.global_step}")
     
     def on_train_end(self, args, state, control, **kwargs):
         """Called when training ends. Final progress update."""
+        logger.info(f"[GenlioProgressCallback] on_train_end called!")
         if not self.training_started:
+            logger.info("[GenlioProgressCallback] on_train_end: training not started, returning")
             return
         
-        logger.info(f"Training ended: final_step={state.global_step}")
+        logger.info(f"[GenlioProgressCallback] Training ended: final_step={state.global_step}")
         
         # Final metrics from last log entry
         metrics = {}
@@ -660,8 +676,15 @@ class GenlioWorker:
                 job_id=job.job_id,
             )
             
+            callbacks_list = [progress_callback]
+            logger.info(f"[DEBUG] Created callbacks list: {callbacks_list}")
+            logger.info(f"[DEBUG] Callback types: {[type(cb).__name__ for cb in callbacks_list]}")
+            logger.info(f"[DEBUG] Callback repr: {[repr(cb) for cb in callbacks_list]}")
+            
             # Run training with callback
-            run_exp(args=args, callbacks=[progress_callback])
+            logger.info(f"[DEBUG] Calling run_exp with callbacks={callbacks_list}")
+            run_exp(args=args, callbacks=callbacks_list)
+            logger.info(f"[DEBUG] run_exp completed")
             
             # Determine adapter path
             adapter_path = output_dir

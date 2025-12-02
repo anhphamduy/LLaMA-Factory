@@ -45,6 +45,8 @@ def run_sft(
     generating_args: "GeneratingArguments",
     callbacks: Optional[list["TrainerCallback"]] = None,
 ):
+    logger.info_rank0(f"[DEBUG run_sft] Received callbacks: {callbacks}")
+    logger.info_rank0(f"[DEBUG run_sft] Callback types: {[type(cb).__name__ for cb in (callbacks or [])]}")
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
@@ -79,6 +81,7 @@ def run_sft(
     gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
 
     # Initialize our Trainer
+    logger.info_rank0(f"[DEBUG run_sft] Creating trainer with callbacks: {callbacks}")
     trainer = CustomSeq2SeqTrainer(
         model=model,
         args=training_args,
@@ -90,6 +93,7 @@ def run_sft(
         **tokenizer_module,
         **metric_module,
     )
+    logger.info_rank0(f"[DEBUG run_sft] Trainer callback_handler callbacks: {trainer.callback_handler.callbacks}")
 
     # Training
     if training_args.do_train:

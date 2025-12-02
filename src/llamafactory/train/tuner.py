@@ -52,6 +52,8 @@ logger = logging.get_logger(__name__)
 def _training_function(config: dict[str, Any]) -> None:
     args = config.get("args")
     callbacks: list[Any] = config.get("callbacks")
+    logger.info_rank0(f"[DEBUG _training_function] Received callbacks: {callbacks}")
+    logger.info_rank0(f"[DEBUG _training_function] Callback types: {[type(cb).__name__ for cb in (callbacks or [])]}")
     model_args, data_args, training_args, finetuning_args, generating_args = get_train_args(args)
 
     callbacks.append(LogCallback())
@@ -65,6 +67,9 @@ def _training_function(config: dict[str, Any]) -> None:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=finetuning_args.early_stopping_steps))
 
     callbacks.append(ReporterCallback(model_args, data_args, finetuning_args, generating_args))  # add to last
+    
+    logger.info_rank0(f"[DEBUG _training_function] Final callbacks list: {callbacks}")
+    logger.info_rank0(f"[DEBUG _training_function] Final callback types: {[type(cb).__name__ for cb in callbacks]}")
 
     if finetuning_args.stage in ["pt", "sft", "dpo"] and finetuning_args.use_mca:
         if not is_mcore_adapter_available():
