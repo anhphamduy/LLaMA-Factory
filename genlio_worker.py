@@ -13,6 +13,7 @@ Usage:
 Environment variables:
     DATABASE_URL: PostgreSQL connection string
     WORKER_ID: Unique identifier for this worker (auto-generated if not set)
+    WORKER_NAME: Human-readable name for this worker (optional)
     POLL_INTERVAL: Seconds between polls (default: 10)
     DATA_DIR: Directory for LLaMA-Factory datasets (default: ./data)
     OUTPUT_DIR: Base directory for training outputs (default: ./outputs)
@@ -27,17 +28,21 @@ import io
 import json
 import logging
 import os
+import platform
 import signal
+import socket
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 import pandas as pd
+import psutil
 from sqlalchemy import create_engine, Column, String, Integer, Float, Text, JSON, ForeignKey
 from sqlalchemy.orm import sessionmaker, declarative_base
 from transformers import TrainerCallback
@@ -110,16 +115,352 @@ class Dataset(Base):
     latest_version = Column(String(255), nullable=True)
 
 
+class WorkerStatus(Base):
+    """Worker status for monitoring."""
+    __tablename__ = "worker_status"
+
+    worker_id = Column(String(255), primary_key=True)
+    worker_type = Column(String(32), nullable=False)
+    worker_name = Column(String(255), nullable=True)
+    status = Column(String(32), nullable=False, default="offline")
+    current_job_id = Column(String(255), nullable=True)
+    current_job_name = Column(String(255), nullable=True)
+    hostname = Column(String(255), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+    cpu_count = Column(Integer, nullable=True)
+    cpu_percent = Column(Float, nullable=True)
+    memory_total_gb = Column(Float, nullable=True)
+    memory_used_gb = Column(Float, nullable=True)
+    memory_percent = Column(Float, nullable=True)
+    gpu_count = Column(Integer, nullable=True)
+    gpus = Column(JSON, nullable=True)
+    disk_total_gb = Column(Float, nullable=True)
+    disk_used_gb = Column(Float, nullable=True)
+    disk_percent = Column(Float, nullable=True)
+    python_version = Column(String(32), nullable=True)
+    torch_version = Column(String(32), nullable=True)
+    cuda_version = Column(String(32), nullable=True)
+    jobs_completed = Column(Integer, nullable=True, default=0)
+    jobs_failed = Column(Integer, nullable=True, default=0)
+    started_at = Column(String(64), nullable=False)
+    last_heartbeat = Column(String(64), nullable=False)
+
+
 @dataclass
 class WorkerConfig:
     """Worker configuration."""
     database_url: str
     worker_id: str
+    worker_name: Optional[str]
     poll_interval: int
     data_dir: Path
     output_dir: Path
     supabase_url: str
     supabase_key: str
+
+
+class StatusReporter:
+    """Reports worker status and system metrics to the database."""
+
+    def __init__(
+        self,
+        session_factory,
+        worker_id: str,
+        worker_type: str,
+        worker_name: Optional[str] = None,
+        heartbeat_interval: float = 5.0,
+    ):
+        self.session_factory = session_factory
+        self.worker_id = worker_id
+        self.worker_type = worker_type
+        self.worker_name = worker_name or f"{worker_type}-{worker_id[:8]}"
+        self.heartbeat_interval = heartbeat_interval
+        
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._current_job_id: Optional[str] = None
+        self._current_job_name: Optional[str] = None
+        self._jobs_completed = 0
+        self._jobs_failed = 0
+        self._started_at = _now_iso()
+        
+        # Cache static info
+        self._static_info = self._collect_static_info()
+
+    def _collect_static_info(self) -> Dict[str, Any]:
+        """Collect static system information (doesn't change during runtime)."""
+        info = {
+            "hostname": socket.gethostname(),
+            "ip_address": self._get_ip_address(),
+            "cpu_count": psutil.cpu_count(logical=True),
+            "python_version": platform.python_version(),
+        }
+        
+        # Get memory total
+        mem = psutil.virtual_memory()
+        info["memory_total_gb"] = round(mem.total / (1024**3), 2)
+        
+        # Get disk total
+        disk = psutil.disk_usage("/")
+        info["disk_total_gb"] = round(disk.total / (1024**3), 2)
+        
+        # Try to get torch/cuda versions
+        try:
+            import torch
+            info["torch_version"] = torch.__version__
+            if torch.cuda.is_available():
+                info["cuda_version"] = torch.version.cuda
+        except ImportError:
+            pass
+        
+        return info
+
+    def _get_ip_address(self) -> str:
+        """Get the local IP address."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
+
+    def _collect_gpu_metrics(self) -> tuple[int, List[Dict[str, Any]]]:
+        """Collect comprehensive GPU metrics using pynvml (nvidia-smi) and torch."""
+        gpus = []
+        gpu_count = 0
+        
+        # First try pynvml for accurate system-wide GPU metrics
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            gpu_count = pynvml.nvmlDeviceGetCount()
+            
+            for i in range(gpu_count):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                
+                # Get GPU name
+                name = pynvml.nvmlDeviceGetName(handle)
+                if isinstance(name, bytes):
+                    name = name.decode('utf-8')
+                
+                # Get memory info (actual system memory usage, not just PyTorch)
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                mem_total_gb = mem_info.total / (1024**3)
+                mem_used_gb = mem_info.used / (1024**3)
+                mem_percent = (mem_info.used / mem_info.total) * 100 if mem_info.total > 0 else 0
+                
+                gpu_info = {
+                    "index": i,
+                    "name": name,
+                    "memory_total_gb": round(mem_total_gb, 2),
+                    "memory_used_gb": round(mem_used_gb, 2),
+                    "memory_free_gb": round((mem_info.total - mem_info.used) / (1024**3), 2),
+                    "memory_percent": round(mem_percent, 1),
+                }
+                
+                # Get GPU utilization
+                try:
+                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    gpu_info["utilization_gpu"] = util.gpu
+                    gpu_info["utilization_memory"] = util.memory
+                except Exception:
+                    pass
+                
+                # Get temperature
+                try:
+                    temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+                    gpu_info["temperature_c"] = temp
+                except Exception:
+                    pass
+                
+                # Get power usage
+                try:
+                    power = pynvml.nvmlDeviceGetPowerUsage(handle)  # milliwatts
+                    power_limit = pynvml.nvmlDeviceGetPowerManagementLimit(handle)
+                    gpu_info["power_watts"] = round(power / 1000, 1)
+                    gpu_info["power_limit_watts"] = round(power_limit / 1000, 1)
+                except Exception:
+                    pass
+                
+                # Get fan speed (may not be available on all GPUs)
+                try:
+                    fan_speed = pynvml.nvmlDeviceGetFanSpeed(handle)
+                    gpu_info["fan_speed_percent"] = fan_speed
+                except Exception:
+                    pass
+                
+                # Get compute processes running on this GPU
+                try:
+                    processes = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+                    gpu_info["process_count"] = len(processes)
+                except Exception:
+                    pass
+                
+                # Get PyTorch-specific memory if available
+                try:
+                    import torch
+                    if torch.cuda.is_available() and i < torch.cuda.device_count():
+                        gpu_info["pytorch_allocated_gb"] = round(torch.cuda.memory_allocated(i) / (1024**3), 2)
+                        gpu_info["pytorch_reserved_gb"] = round(torch.cuda.memory_reserved(i) / (1024**3), 2)
+                except Exception:
+                    pass
+                
+                gpus.append(gpu_info)
+                
+        except ImportError:
+            # Fall back to torch-only metrics if pynvml not available
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    gpu_count = torch.cuda.device_count()
+                    for i in range(gpu_count):
+                        props = torch.cuda.get_device_properties(i)
+                        mem_total = props.total_memory / (1024**3)
+                        mem_reserved = torch.cuda.memory_reserved(i) / (1024**3)
+                        
+                        gpu_info = {
+                            "index": i,
+                            "name": props.name,
+                            "memory_total_gb": round(mem_total, 2),
+                            "memory_used_gb": round(mem_reserved, 2),
+                            "memory_percent": round((mem_reserved / mem_total) * 100, 1) if mem_total > 0 else 0,
+                            "pytorch_allocated_gb": round(torch.cuda.memory_allocated(i) / (1024**3), 2),
+                            "pytorch_reserved_gb": round(mem_reserved, 2),
+                        }
+                        gpus.append(gpu_info)
+            except ImportError:
+                pass
+        except Exception as e:
+            logger.warning(f"Error collecting GPU metrics: {e}")
+        
+        return gpu_count, gpus
+
+    def _collect_dynamic_metrics(self) -> Dict[str, Any]:
+        """Collect dynamic system metrics."""
+        metrics = {}
+        
+        # CPU usage
+        metrics["cpu_percent"] = psutil.cpu_percent(interval=0.1)
+        
+        # Memory usage
+        mem = psutil.virtual_memory()
+        metrics["memory_used_gb"] = round(mem.used / (1024**3), 2)
+        metrics["memory_percent"] = mem.percent
+        
+        # Disk usage
+        disk = psutil.disk_usage("/")
+        metrics["disk_used_gb"] = round(disk.used / (1024**3), 2)
+        metrics["disk_percent"] = round(disk.percent, 1)
+        
+        # GPU metrics
+        gpu_count, gpus = self._collect_gpu_metrics()
+        metrics["gpu_count"] = gpu_count
+        metrics["gpus"] = gpus
+        
+        return metrics
+
+    def _update_status(self):
+        """Update worker status in the database."""
+        try:
+            dynamic_metrics = self._collect_dynamic_metrics()
+            
+            with self.session_factory() as session:
+                worker_status = session.get(WorkerStatus, self.worker_id)
+                
+                if worker_status is None:
+                    # Create new record
+                    worker_status = WorkerStatus(
+                        worker_id=self.worker_id,
+                        worker_type=self.worker_type,
+                        worker_name=self.worker_name,
+                        started_at=self._started_at,
+                    )
+                    session.add(worker_status)
+                
+                # Update static info
+                worker_status.hostname = self._static_info.get("hostname")
+                worker_status.ip_address = self._static_info.get("ip_address")
+                worker_status.cpu_count = self._static_info.get("cpu_count")
+                worker_status.memory_total_gb = self._static_info.get("memory_total_gb")
+                worker_status.disk_total_gb = self._static_info.get("disk_total_gb")
+                worker_status.python_version = self._static_info.get("python_version")
+                worker_status.torch_version = self._static_info.get("torch_version")
+                worker_status.cuda_version = self._static_info.get("cuda_version")
+                
+                # Update dynamic metrics
+                worker_status.cpu_percent = dynamic_metrics.get("cpu_percent")
+                worker_status.memory_used_gb = dynamic_metrics.get("memory_used_gb")
+                worker_status.memory_percent = dynamic_metrics.get("memory_percent")
+                worker_status.disk_used_gb = dynamic_metrics.get("disk_used_gb")
+                worker_status.disk_percent = dynamic_metrics.get("disk_percent")
+                worker_status.gpu_count = dynamic_metrics.get("gpu_count")
+                worker_status.gpus = dynamic_metrics.get("gpus")
+                
+                # Update job info
+                worker_status.status = "busy" if self._current_job_id else "online"
+                worker_status.current_job_id = self._current_job_id
+                worker_status.current_job_name = self._current_job_name
+                worker_status.jobs_completed = self._jobs_completed
+                worker_status.jobs_failed = self._jobs_failed
+                
+                # Update heartbeat
+                worker_status.last_heartbeat = _now_iso()
+                
+                session.commit()
+                
+        except Exception as e:
+            logger.error(f"Failed to update worker status: {e}")
+
+    def _heartbeat_loop(self):
+        """Background thread that sends periodic heartbeats."""
+        while self._running:
+            self._update_status()
+            time.sleep(self.heartbeat_interval)
+
+    def start(self):
+        """Start the status reporter background thread."""
+        if self._running:
+            return
+        
+        self._running = True
+        self._thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._thread.start()
+        logger.info(f"Status reporter started for worker {self.worker_id}")
+
+    def stop(self):
+        """Stop the status reporter and mark worker as offline."""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2)
+        
+        # Mark as offline
+        try:
+            with self.session_factory() as session:
+                worker_status = session.get(WorkerStatus, self.worker_id)
+                if worker_status:
+                    worker_status.status = "offline"
+                    worker_status.current_job_id = None
+                    worker_status.current_job_name = None
+                    worker_status.last_heartbeat = _now_iso()
+                    session.commit()
+        except Exception as e:
+            logger.error(f"Failed to mark worker as offline: {e}")
+        
+        logger.info(f"Status reporter stopped for worker {self.worker_id}")
+
+    def set_current_job(self, job_id: Optional[str], job_name: Optional[str] = None):
+        """Set the current job being processed."""
+        self._current_job_id = job_id
+        self._current_job_name = job_name
+
+    def record_job_completed(self, success: bool = True):
+        """Record a job completion."""
+        if success:
+            self._jobs_completed += 1
+        else:
+            self._jobs_failed += 1
 
 
 def _now_iso() -> str:
@@ -384,11 +725,21 @@ class GenlioWorker:
         # Supabase HTTP client for storage access
         self.http_client = httpx.Client(timeout=300)
         
+        # Status reporter for monitoring
+        self.status_reporter = StatusReporter(
+            session_factory=self.SessionLocal,
+            worker_id=config.worker_id,
+            worker_type="training",
+            worker_name=config.worker_name,
+            heartbeat_interval=5.0,
+        )
+        
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         
         logger.info(f"Worker {config.worker_id} initialized")
+        logger.info(f"Worker name: {config.worker_name or 'auto'}")
         logger.info(f"Data directory: {config.data_dir}")
         logger.info(f"Output directory: {config.output_dir}")
         logger.info(f"Supabase URL: {config.supabase_url}")
@@ -397,6 +748,9 @@ class GenlioWorker:
         """Handle shutdown signals gracefully."""
         logger.info(f"Received signal {signum}, shutting down...")
         self.running = False
+        
+        # Stop status reporter
+        self.status_reporter.stop()
         
         # If we're currently processing a job, mark it as failed
         if self.current_job:
@@ -807,8 +1161,10 @@ class GenlioWorker:
     def _process_job(self, job: FineTuningJob):
         """Process a single fine-tuning job."""
         self.current_job = job
+        self.status_reporter.set_current_job(job.job_id, job.job_name)
         logger.info(f"Processing job {job.job_id}: {job.job_name or 'Unnamed'}")
         
+        job_success = False
         try:
             # Update status to running
             self._update_job_status(
@@ -842,6 +1198,7 @@ class GenlioWorker:
                     completed_at=_now_iso(),
                 )
                 logger.info(f"Job {job.job_id} completed successfully")
+                job_success = True
             else:
                 self._update_job_status(
                     job.job_id,
@@ -861,26 +1218,35 @@ class GenlioWorker:
             )
         finally:
             self.current_job = None
+            self.status_reporter.set_current_job(None, None)
+            self.status_reporter.record_job_completed(success=job_success)
 
     def run(self):
         """Main worker loop."""
         logger.info(f"Worker {self.config.worker_id} starting main loop")
         
-        while self.running:
-            try:
-                # Try to claim a job
-                job = self._claim_next_job()
-                
-                if job:
-                    self._process_job(job)
-                else:
-                    # No jobs available, wait before polling again
-                    logger.debug(f"No pending jobs, waiting {self.config.poll_interval}s...")
-                    time.sleep(self.config.poll_interval)
+        # Start the status reporter
+        self.status_reporter.start()
+        
+        try:
+            while self.running:
+                try:
+                    # Try to claim a job
+                    job = self._claim_next_job()
                     
-            except Exception as e:
-                logger.exception(f"Error in main loop: {e}")
-                time.sleep(self.config.poll_interval)
+                    if job:
+                        self._process_job(job)
+                    else:
+                        # No jobs available, wait before polling again
+                        logger.debug(f"No pending jobs, waiting {self.config.poll_interval}s...")
+                        time.sleep(self.config.poll_interval)
+                        
+                except Exception as e:
+                    logger.exception(f"Error in main loop: {e}")
+                    time.sleep(self.config.poll_interval)
+        finally:
+            # Stop the status reporter
+            self.status_reporter.stop()
         
         logger.info("Worker shutting down")
 
@@ -896,6 +1262,11 @@ def main():
         "--worker-id",
         default=os.environ.get("WORKER_ID", str(uuid.uuid4())[:8]),
         help="Unique worker identifier",
+    )
+    parser.add_argument(
+        "--worker-name",
+        default=os.environ.get("WORKER_NAME"),
+        help="Human-readable worker name",
     )
     parser.add_argument(
         "--poll-interval",
@@ -940,6 +1311,7 @@ def main():
     config = WorkerConfig(
         database_url=args.database_url,
         worker_id=args.worker_id,
+        worker_name=args.worker_name,
         poll_interval=args.poll_interval,
         data_dir=args.data_dir,
         output_dir=args.output_dir,
